@@ -1,0 +1,26 @@
+# Arduino IDE / ESP32 generated output
+.pio/
+build/
+**/build/
+**/Debug/
+**/Release/
+*.elf
+*.bin
+*.hex
+*.map
+*.uf2
+*.o
+*.a
+*.d
+*.tmp
+
+# Local editor and operating-system files
+.vs/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Arduino IDE local state
+arduino/*/build/
+arduino/*/libraries/*/examples/*/build/
