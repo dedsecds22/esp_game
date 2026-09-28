@@ -32,6 +32,10 @@ constexpr uint8_t kMsgRepair = 0x05;
 constexpr uint8_t kMsgBombState = 0x06;
 constexpr uint32_t kHeartbeatMs = 2000;
 constexpr uint32_t kIrCooldownMs = 8000;
+constexpr uint32_t kMeshTestTimeoutMs = 5000;
+constexpr uint32_t kMeshTestRetryMs = 500;
+constexpr uint32_t kIrTestTimeoutMs = 15000;
+constexpr uint32_t kTftVisualTestMs = 5000;
 constexpr uint32_t kIrNecCode = 0x00FF18E7;
 constexpr uint8_t kIrTxPin = 6;
 constexpr uint8_t kIrRxPin = 7;
@@ -149,12 +153,22 @@ struct TenetFirmware::Impl {
     uint32_t lastHeartbeatAt = 0;
     uint32_t lastIrTriggerAt = 0;
     uint32_t lastDisplayAt = 0;
+    uint32_t tftVisualTestUntil = 0;
     uint32_t bombRemainingSeconds = 60;
     uint32_t bombStartedAt = 0;
     uint32_t lastButtonChangeAt = 0;
+    uint32_t meshTestStartedAt = 0;
+    uint32_t meshTestLastPingAt = 0;
+    uint32_t irTestStartedAt = 0;
     bool bombRunning = false;
     bool irHasTriggered = false;
+    bool displayReady = false;
+    bool meshTestActive = false;
+    bool irTestActive = false;
     bool previousButtonState = HIGH;
+    uint8_t meshTestReceivedMask = 0;
+    uint8_t meshTestDisplayMask = 0;
+    int8_t meshTestRssi[6] = {-127, -127, -127, -127, -127, -127};
     size_t serialLineLength = 0;
     char serialLine[384]{};
     SeenPacket seenPackets[32]{};
@@ -240,6 +254,72 @@ struct TenetFirmware::Impl {
         sendLocalPacket(kMsgBombState, kBroadcastId, payload);
     }
 
+    void startMeshTest() {
+        meshTestActive = true;
+        meshTestReceivedMask = 0;
+        meshTestDisplayMask = 0;
+        memset(meshTestRssi, -127, sizeof(meshTestRssi));
+        meshTestStartedAt = millis();
+        meshTestLastPingAt = 0;
+        Serial.println("{\"event\":\"mesh_test\",\"status\":\"started\",\"expected\":4}");
+    }
+
+    void startIrTest() {
+        irTestActive = true;
+        irTestStartedAt = millis();
+        Serial.println("{\"event\":\"ir_test\",\"status\":\"waiting\",\"timeout_ms\":15000}");
+    }
+
+    const char *nodeRoleName(uint8_t id) const {
+        switch (id) {
+            case 0: return "TFT_NORMAL";
+            case 1: return "TFT_INVERSE";
+            case 3: return "RELAY";
+            case 4: return "IR_GATE";
+            default: return "UNKNOWN";
+        }
+    }
+
+    void finishMeshTest() {
+        static constexpr uint8_t expectedNodes[] = {0, 1, 3, 4};
+        uint8_t onlineCount = 0;
+        for (uint8_t id : expectedNodes) {
+            const bool online = (meshTestReceivedMask & (1U << id)) != 0;
+            onlineCount += online ? 1 : 0;
+            StaticJsonDocument<192> document;
+            document["event"] = "mesh_test_node";
+            document["node"] = id;
+            document["role"] = nodeRoleName(id);
+            document["status"] = online ? "PASS" : "FAIL";
+            document["rssi"] = online ? meshTestRssi[id] : -127;
+            if (id == 0 || id == 1) {
+                document["display"] = (meshTestDisplayMask & (1U << id)) != 0
+                    ? "INIT_PASS" : "INIT_FAIL";
+            }
+            serializeJson(document, Serial);
+            Serial.println();
+        }
+        StaticJsonDocument<128> summary;
+        summary["event"] = "mesh_test_summary";
+        summary["status"] = onlineCount == sizeof(expectedNodes) ? "PASS" : "FAIL";
+        summary["online"] = onlineCount;
+        summary["expected"] = sizeof(expectedNodes);
+        summary["tft_init"] = (meshTestDisplayMask & 0x03) == 0x03 ? "PASS" : "FAIL";
+        serializeJson(summary, Serial);
+        Serial.println();
+        meshTestActive = false;
+    }
+
+    void finishIrTest(bool passed) {
+        StaticJsonDocument<128> document;
+        document["event"] = "ir_test";
+        document["status"] = passed ? "PASS" : "FAIL";
+        document["path"] = "IR_REMOTE->IR_GATE->ESP_NOW->GATEWAY";
+        serializeJson(document, Serial);
+        Serial.println();
+        irTestActive = false;
+    }
+
     void emitPacketJson(const ReceivedFrame &frame) {
         StaticJsonDocument<256> document;
         char payload[sizeof(frame.packet.payload) + 1]{};
@@ -270,6 +350,10 @@ struct TenetFirmware::Impl {
             sendLocalPacket(kMsgRepair, target, key);
         } else if (strcmp(command, "invert") == 0) {
             sendLocalPacket(kMsgInvertTime, kBroadcastId, "INVERT");
+        } else if (strcmp(command, "test") == 0) {
+            startMeshTest();
+        } else if (strcmp(command, "test_ir") == 0) {
+            startIrTest();
         } else if (strcmp(command, "ping") == 0) {
             Serial.println("{\"event\":\"gateway_ready\",\"node\":5}");
         } else {
@@ -284,16 +368,39 @@ struct TenetFirmware::Impl {
         }
         if (role == TenetRole::Gateway) {
             emitPacketJson(frame);
+            if (packet.msgType == kMsgHeartbeat &&
+                strncmp(packet.payload, "PONG:", 5) == 0 &&
+                packet.srcNode < 6 && meshTestActive) {
+                meshTestReceivedMask |= 1U << packet.srcNode;
+                meshTestRssi[packet.srcNode] = frame.rssi;
+                if ((packet.srcNode == 0 || packet.srcNode == 1) &&
+                    strcmp(packet.payload, "PONG:LCD_OK") == 0) {
+                    meshTestDisplayMask |= 1U << packet.srcNode;
+                }
+            }
+            if (packet.msgType == kMsgInvertTime && packet.srcNode == 4 &&
+                strcmp(packet.payload, "IR_INVERT") == 0 && irTestActive) {
+                finishIrTest(true);
+            }
         }
-        if ((role == TenetRole::TftNormal || role == TenetRole::TftInverse) &&
-            (packet.dstNode == nodeId || packet.dstNode == kBroadcastId)) {
+        if (packet.dstNode == nodeId || packet.dstNode == kBroadcastId) {
             if (packet.msgType == kMsgInvertTime) {
-                timeDirection = -timeDirection;
+                if (role == TenetRole::TftNormal || role == TenetRole::TftInverse) {
+                    timeDirection = -timeDirection;
+                }
             } else if (packet.msgType == kMsgBombState &&
-                       strncmp(packet.payload, "START:", 6) == 0) {
+                       strncmp(packet.payload, "START:", 6) == 0 &&
+                       (role == TenetRole::TftNormal || role == TenetRole::TftInverse)) {
                 bombRemainingSeconds = strtoul(packet.payload + 6, nullptr, 10);
                 bombStartedAt = millis();
                 bombRunning = true;
+            } else if (packet.msgType == kMsgHeartbeat &&
+                       strcmp(packet.payload, "TEST_PING") == 0) {
+                const char *response = "PONG:OK";
+                if (role == TenetRole::TftNormal || role == TenetRole::TftInverse) {
+                    response = displayReady ? "PONG:LCD_OK" : "PONG:LCD_FAIL";
+                }
+                sendLocalPacket(kMsgHeartbeat, 5, response);
             }
         }
     }
@@ -324,6 +431,28 @@ struct TenetFirmware::Impl {
             return;
         }
         lastDisplayAt = now;
+        if (now < tftVisualTestUntil) {
+            canvas.fillScreen(TFT_BLACK);
+            canvas.setTextColor(TFT_WHITE);
+            canvas.setFont(&fonts::Font4);
+            canvas.drawCenterString("ILI9341 DISPLAY TEST", 160, 22);
+            canvas.setTextColor(TFT_CYAN);
+            canvas.setFont(&fonts::Font2);
+            canvas.drawCenterString(role == TenetRole::TftNormal ? "NODE 0 / BLUE" : "NODE 1 / RED",
+                                    160, 54);
+            const uint16_t colors[] = {TFT_RED, TFT_GREEN, TFT_BLUE, TFT_WHITE, TFT_YELLOW, TFT_CYAN};
+            for (int index = 0; index < 6; ++index) {
+                const int x = 20 + (index % 3) * 96;
+                const int y = 88 + (index / 3) * 58;
+                canvas.fillRect(x, y, 84, 44, colors[index]);
+                canvas.drawRect(x, y, 84, 44, TFT_DARKGREY);
+            }
+            canvas.setTextColor(TFT_WHITE);
+            canvas.drawCenterString("COLOR  ORIENTATION  SPRITE", 160, 218);
+            canvas.pushSprite(0, 0);
+            return;
+        }
+
         uint32_t elapsed = bombRunning ? (now - bombStartedAt) / 1000 : 0;
         if (elapsed > bombRemainingSeconds) {
             elapsed = bombRemainingSeconds;
@@ -354,7 +483,9 @@ struct TenetFirmware::Impl {
         WiFi.disconnect();
         esp_wifi_set_channel(kWifiChannel, WIFI_SECOND_CHAN_NONE);
         if (esp_now_init() != ESP_OK) {
-            Serial.println("{\"error\":\"esp_now_init_failed\"}");
+            if (role == TenetRole::Gateway) {
+                Serial.println("{\"error\":\"esp_now_init_failed\"}");
+            }
             return;
         }
         active = this;
@@ -370,16 +501,20 @@ struct TenetFirmware::Impl {
             irTransmitter.begin();
             return;
         }
-        Serial.begin(role == TenetRole::Gateway ? 2000000 : 115200);
+        if (role == TenetRole::Gateway) {
+            Serial.begin(2000000);
+        }
         setupRadio();
         if (role == TenetRole::IrGate) {
             irReceiver.enableIRIn();
         } else if (role == TenetRole::TftNormal || role == TenetRole::TftInverse) {
-            display.init();
+            displayReady = display.init();
             display.setRotation(1);
-            canvas.createSprite(320, 240);
-            canvas.setSwapBytes(true);
-            canvas.fillScreen(TFT_BLACK);
+            displayReady = canvas.createSprite(320, 240) != nullptr && displayReady;
+            if (displayReady) {
+                canvas.setSwapBytes(true);
+                tftVisualTestUntil = millis() + kTftVisualTestMs;
+            }
         }
     }
 
@@ -434,6 +569,19 @@ struct TenetFirmware::Impl {
         }
         if (role == TenetRole::Gateway) {
             updateGatewaySerial();
+            const uint32_t now = millis();
+            if (meshTestActive) {
+                if (now - meshTestLastPingAt >= kMeshTestRetryMs) {
+                    meshTestLastPingAt = now;
+                    sendLocalPacket(kMsgHeartbeat, kBroadcastId, "TEST_PING");
+                }
+                if (now - meshTestStartedAt >= kMeshTestTimeoutMs) {
+                    finishMeshTest();
+                }
+            }
+            if (irTestActive && now - irTestStartedAt >= kIrTestTimeoutMs) {
+                finishIrTest(false);
+            }
         }
         if (receiveQueue != nullptr) {
             ReceivedFrame frame{};
