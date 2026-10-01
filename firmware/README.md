@@ -14,6 +14,28 @@ remote.
 4. Open a sketch under `firmware/Arduino/sketches` and select an ESP32-S3
 	board. For the Gateway, enable USB CDC On Boot and select 2,000,000 baud.
 
+### ESP32-S3 upload troubleshooting
+
+`Failed to connect to ESP32-S3: No serial data received` means esptool
+opened a COM port but did not receive a ROM-bootloader response. The
+runtime USB CDC setting does not itself put the chip in download mode.
+
+For the native USB connector, select `USB Mode: Hardware CDC and JTAG`,
+`Upload Mode: UART0 / Hardware CDC`, and `USB CDC On Boot: Enabled`. Close
+Serial Monitor, select the ESP32-S3's current COM port, and try:
+
+1. Hold the board's `BOOT` button.
+2. While holding it, click Upload in Arduino IDE.
+3. When the console shows `Connecting...`, release `BOOT`.
+
+If it still does not connect, hold `BOOT`, tap and release `RESET/EN`,
+then release `BOOT` and retry Upload. Lower `Upload Speed` to `115200`.
+The port can disappear and reappear when the chip changes from application
+mode to ROM bootloader mode; reselect the newly appearing ESP32-S3 port if
+needed. Make sure the cable carries data and that it is plugged into the
+board's native USB connector, not its UART-only connector. Do not select
+the Gateway runtime baud rate as the upload speed.
+
 Open the sketch matching the ESP being flashed:
 
 - `TenetGateway/TenetGateway.ino` - USB serial bridge, node ID 5
@@ -22,6 +44,37 @@ Open the sketch matching the ESP being flashed:
 - `TenetRelay/TenetRelay.ino` - relay, node ID 3
 - `TenetIrGate/TenetIrGate.ino` - IR receiver and mesh broadcaster, node ID 4
 - `TenetIrRemote/TenetIrRemote.ino` - standalone battery remote, node ID 2
+- `TenetIrGateRawTest/TenetIrGateRawTest.ino` - temporary raw sensor test
+- `TenetIrRemoteRawTest/TenetIrRemoteRawTest.ino` - temporary 38 kHz LED test
+
+## Temporary raw IR test
+
+Use these temporary sketches before trying the mesh IR roles. Upload each
+to its own ESP32 separately; open Serial Monitor at 115200 baud. They do
+not initialize ESP-NOW.
+
+For the receiver, connect VCC/GND and its signal wire to GPIO 7. Open
+`TenetIrGateRawTest.ino`; the sketch prints the raw input every second and
+prints each HIGH/LOW transition. Many demodulating receiver modules idle
+HIGH and go LOW while receiving, but use the printed raw level if your
+sensor has different polarity. Power the sensor at 3.3 V if supported and
+ensure its signal output never exceeds 3.3 V; ESP32-S3 GPIOs are not 5 V
+tolerant. Use a level shifter or divider if the sensor outputs 5 V.
+
+For a bare two-lead IR LED, connect GPIO 6 to the LED anode through a
+current-limiting resistor and connect its cathode to GND. Do not connect a
+bare LED directly across VCC/GND or directly to a GPIO without current
+limiting. If the two-lead part is a prebuilt module that expects a supply,
+do not connect its VCC directly to GPIO 6; switch its supply with a suitable
+transistor instead. Open `TenetIrRemoteRawTest.ino` and send `1` to enable
+the 38 kHz carrier, `0` to stop it, `b` for a 200 ms burst, or `a` to
+toggle repeating 100 ms bursts once per second. Start `a`, then switch the
+Serial Monitor to the receiver's COM port and observe its input. The IR
+light is invisible.
+
+This test checks the emitter, sensor output, and wiring only. It does not
+send a NEC command or exercise ESP-NOW. A receiver that is only a bare
+phototransistor may respond differently from a 38 kHz demodulating module.
 
 ## TFT wiring
 
@@ -63,8 +116,17 @@ increasing counter. The Gateway reports display initialization over
 ESP-NOW; because this SPI wiring does not read pixels back, the color and
 orientation check must be done by looking at both panels.
 
-Open the Gateway Serial Monitor at 2,000,000 baud with newline line
-ending. Send:
+The Gateway is intentionally silent at startup. Open its Serial Monitor at
+2,000,000 baud and set the line ending to `Newline` (not `No line ending`).
+First send this probe:
+
+```json
+{"cmd":"ping"}
+```
+
+Expect `{"event":"gateway_ready","node":5}`. The command parser only
+processes a command after it receives the terminating newline. Once this
+probe works, send the mesh test:
 
 ```json
 {"cmd":"test"}
