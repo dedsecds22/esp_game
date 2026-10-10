@@ -1,5 +1,9 @@
 # Arduino IDE / ESP32 generated output
 .pio/
+.venv/
+**/.venv/
+__pycache__/
+*.py[cod]
 build/
 **/build/
 **/Debug/

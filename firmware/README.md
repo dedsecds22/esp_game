@@ -47,6 +47,13 @@ Open the sketch matching the ESP being flashed:
 - `TenetIrGateRawTest/TenetIrGateRawTest.ino` - temporary raw sensor test
 - `TenetIrRemoteRawTest/TenetIrRemoteRawTest.ino` - temporary 38 kHz LED test
 
+The production IR_GATE uses the measured sensor polarity: GPIO 7 is LOW
+when idle and HIGH when IR is detected. It sends one mesh inversion on a
+LOW-to-HIGH transition, with the normal 8-second cooldown. It does not
+decode a NEC address or command; any IR source visible to the sensor can
+trigger it. The remote still emits the NEC-modulated IR frame, which the
+simple sensor only treats as detected light.
+
 ## Temporary raw IR test
 
 Use these temporary sketches before trying the mesh IR roles. Upload each
@@ -55,9 +62,8 @@ not initialize ESP-NOW.
 
 For the receiver, connect VCC/GND and its signal wire to GPIO 7. Open
 `TenetIrGateRawTest.ino`; the sketch prints the raw input every second and
-prints each HIGH/LOW transition. Many demodulating receiver modules idle
-HIGH and go LOW while receiving, but use the printed raw level if your
-sensor has different polarity. Power the sensor at 3.3 V if supported and
+prints each HIGH/LOW transition. This device has been verified LOW while
+idle and HIGH while receiving. Power the sensor at 3.3 V if supported and
 ensure its signal output never exceeds 3.3 V; ESP32-S3 GPIOs are not 5 V
 tolerant. Use a level shifter or divider if the sensor outputs 5 V.
 
@@ -98,8 +104,8 @@ the current status display.
 
 All mesh nodes use Wi-Fi channel 1. The standalone remote uses an
 active-low button on GPIO 4 and an IR LED driver on GPIO 6. Drive the LED
-through a transistor. IR_GATE receives the 38 kHz signal on GPIO 7. The
-NEC code and these pins are configured in `TenetMesh.cpp`.
+through a transistor. IR_GATE reads the active-HIGH sensor output on GPIO
+7. The remote carrier/code and these pins are configured in `TenetMesh.cpp`.
 
 ## First hardware test
 
@@ -143,8 +149,22 @@ To test the IR remote through to the Gateway, send
 `{"cmd":"test_ir"}` and press the remote button within 15 seconds. Expect
 `ir_test` status `PASS` for `IR_REMOTE->IR_GATE->ESP_NOW->GATEWAY`. A
 timeout indicates the IR code, receiver wiring, or mesh path needs checking.
+Send `{"cmd":"ir_state"}` to query the IR_GATE's input level; the Gateway
+returns an `ir_state` event with `level` set to `LOW` or `HIGH`.
 
-Then run the gameplay transport preflight:
+Then start Defuse from the PC app's Game Mode. A successful mesh test is
+required first. The Gateway chooses an uninfected node at the selected
+difficulty interval and sends an encoded paradox event. Both TFTs display
+one byte of a shared random session key. Join the blue byte as the high
+byte and the red byte as the low byte to form `session_key`. The packet log
+shows the infected node ID and encoded error code; calculate
+`session_key = error_code XOR node_id` and submit the result as a four-digit
+hex repair key. A bad key locks repairs for three seconds. The
+Gateway declares victory when the countdown reaches zero with no paradox,
+or defeat if a mesh node goes offline for five seconds or a paradox remains
+at zero.
+
+For a short transport-only round from Serial Monitor, send:
 
 1. Send `{"cmd":"start","seconds":10}`. Confirm blue counts down from
 	10 and red counts up from 0.
@@ -152,16 +172,15 @@ Then run the gameplay transport preflight:
 	INVERSE. This tests the control broadcast only; the separate IR test
 	checks the handheld-triggered broadcast.
 
-These are connection and display preflight tests, not a claim that all
-game mechanics are complete. Paradox generation/detection, repair-key
-validation, countdown victory handling, and scoring are not implemented
-yet.
+This first playable mode is Defuse. Payload Delivery and scoring remain
+future work.
 
 The Gateway accepts newline-terminated JSON commands such as
-`{"cmd":"start","seconds":60}`, `{"cmd":"repair","target":1,"key":"0x4F2A"}`,
-`{"cmd":"invert"}`, and `{"cmd":"ping"}`. Mesh packets are output as JSON
-lines with `src`, `dst`, `type`, `id`, `dir`, `payload`, and `rssi` fields.
+`{"cmd":"start","seconds":60,"difficulty":"normal"}`, `{"cmd":"repair","target":1,"key":"0x4F2A"}`,
+`{"cmd":"invert"}`, `{"cmd":"ir_state"}`, and `{"cmd":"ping"}`. Mesh
+packets are output as JSON lines with `src`, `dst`, `type`, `id`, `dir`,
+`payload`, and `rssi` fields.
 
 The shared ESP-NOW packet is 25 bytes with an XOR checksum. This firmware
-provides the radio bridge, TFT status screen, IR control, and relay base;
-paradox detection, repair-key verification, and scoring remain future work.
+provides the radio bridge, TFT status screen, IR control, relay base, and
+initial Defuse mechanics. Payload Delivery and scoring remain future work.

@@ -26,6 +26,15 @@ specifikációk és a játékszabályok a repository gyökerében találhatók.
 
 TFT pin-kiosztás, soros parancsok és eszközbeállítások: [firmware README](firmware/README.md).
 
+## PC control app
+
+The Tkinter desktop controller is under `pc_app`. Create its environment
+with `py -3 -m venv pc_app/.venv`, install dependencies using
+`pc_app/.venv/Scripts/python.exe -m pip install -r pc_app/requirements.txt`,
+then run `pc_app/.venv/Scripts/python.exe pc_app/tenet_control.py`. The app
+provides separate Test Mode and Game Mode tabs; details are in
+[pc app README](pc_app/README.md).
+
 ## Dokumentáció
 
 - [Műszaki specifikáció](tenet-mesh-spec.md)

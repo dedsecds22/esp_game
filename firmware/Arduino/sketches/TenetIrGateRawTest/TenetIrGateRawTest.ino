@@ -6,9 +6,9 @@ uint32_t lastReportAt = 0;
 
 void setup() {
     Serial.begin(115200);
-    pinMode(IR_RECEIVER_PIN, INPUT_PULLUP);
+    pinMode(IR_RECEIVER_PIN, INPUT);
     Serial.println("IR_GATE raw input test");
-    Serial.println("Expected common demodulator output: HIGH idle, LOW while receiving.");
+    Serial.println("Observed polarity: LOW idle, HIGH while receiving.");
 }
 
 void loop() {

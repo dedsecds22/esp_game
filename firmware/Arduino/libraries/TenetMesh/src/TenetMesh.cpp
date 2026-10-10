@@ -11,7 +11,6 @@
 #endif
 
 #include <ArduinoJson.h>
-#include <IRrecv.h>
 #include <IRsend.h>
 #include <LovyanGFX.hpp>
 
@@ -37,6 +36,9 @@ constexpr uint32_t kMeshTestRetryMs = 500;
 constexpr uint32_t kIrTestTimeoutMs = 15000;
 constexpr uint32_t kTftVisualTestMs = 5000;
 constexpr uint32_t kIrNecCode = 0x00FF18E7;
+constexpr uint32_t kRepairLockMs = 3000;
+constexpr uint32_t kOfflineTimeoutMs = 5000;
+constexpr uint32_t kRoundStartGraceMs = 5000;
 constexpr uint8_t kIrTxPin = 6;
 constexpr uint8_t kIrRxPin = 7;
 constexpr uint8_t kRemoteButtonPin = 4;
@@ -156,16 +158,32 @@ struct TenetFirmware::Impl {
     uint32_t tftVisualTestUntil = 0;
     uint32_t bombRemainingSeconds = 60;
     uint32_t bombStartedAt = 0;
+    uint32_t frozenElapsedSeconds = 0;
     uint32_t lastButtonChangeAt = 0;
     uint32_t meshTestStartedAt = 0;
     uint32_t meshTestLastPingAt = 0;
     uint32_t irTestStartedAt = 0;
+    uint32_t nextInfectionAt = 0;
+    uint32_t roundDeadline = 0;
+    uint32_t roundStartedAt = 0;
+    uint32_t lastRoundBroadcastAt = 0;
+    uint32_t repairLockUntil = 0;
+    uint32_t lastNodeSeenAt[6]{};
     bool bombRunning = false;
     bool irHasTriggered = false;
     bool displayReady = false;
     bool meshTestActive = false;
     bool irTestActive = false;
+    bool irTestTriggered = false;
     bool previousButtonState = HIGH;
+    int lastIrInputState = LOW;
+    bool roundActive = false;
+    uint16_t sessionKey = 0;
+    uint8_t paradoxMask = 0;
+    uint32_t infectionIntervalMs = 12000;
+    int8_t roundOutcome = 0;
+    bool paradox = false;
+    bool hasSessionKey = false;
     uint8_t meshTestReceivedMask = 0;
     uint8_t meshTestDisplayMask = 0;
     int8_t meshTestRssi[6] = {-127, -127, -127, -127, -127, -127};
@@ -175,15 +193,13 @@ struct TenetFirmware::Impl {
     uint8_t seenPacketCursor = 0;
     LGFX_ESP32S3_ILI9341 display;
     LGFX_Sprite canvas;
-    IRrecv irReceiver;
     IRsend irTransmitter;
-    decode_results irResults{};
 
     static Impl *active;
 
     Impl(TenetRole selectedRole, uint8_t selectedNodeId)
-        : role(selectedRole), nodeId(selectedNodeId), canvas(&display),
-          irReceiver(kIrRxPin), irTransmitter(kIrTxPin) {}
+                : role(selectedRole), nodeId(selectedNodeId), canvas(&display),
+                    irTransmitter(kIrTxPin) {}
 
     bool wasSeen(const TenetPacket &packet) {
         for (const SeenPacket &seen : seenPackets) {
@@ -245,13 +261,109 @@ struct TenetFirmware::Impl {
                               nextPacketId++, payload));
     }
 
-    void startBomb(uint32_t seconds) {
+    void emitGameState(const char *state, const char *detail = nullptr, int nodeId = -1) {
+        StaticJsonDocument<192> document;
+        document["event"] = "game_state";
+        document["state"] = state;
+        if (detail != nullptr) {
+            document["detail"] = detail;
+        }
+        if (nodeId >= 0) {
+            document["node"] = nodeId;
+        }
+        if (strcmp(state, "STARTED") == 0) {
+            document["seconds"] = (roundDeadline - roundStartedAt) / 1000UL;
+        }
+        document["paradox_mask"] = paradoxMask;
+        serializeJson(document, Serial);
+        Serial.println();
+    }
+
+    uint32_t nextInfectionDelay() {
+        const uint32_t variance = infectionIntervalMs / 5;
+        const uint32_t low = infectionIntervalMs > variance
+            ? infectionIntervalMs - variance : infectionIntervalMs;
+        return random(low, infectionIntervalMs + variance + 1);
+    }
+
+    void startBomb(uint32_t seconds, const char *difficulty) {
         if (seconds == 0 || seconds > 3600) {
             seconds = 60;
         }
+        if (strcmp(difficulty, "easy") == 0) {
+            infectionIntervalMs = 20000;
+        } else if (strcmp(difficulty, "hard") == 0) {
+            infectionIntervalMs = 6000;
+        } else {
+            infectionIntervalMs = 12000;
+        }
+        randomSeed(esp_random());
+        sessionKey = static_cast<uint16_t>(random(1, 65536));
+        paradoxMask = 0;
+        roundOutcome = 0;
+        roundActive = true;
+        roundStartedAt = millis();
+        roundDeadline = millis() + seconds * 1000UL;
+        nextInfectionAt = millis() + nextInfectionDelay();
+        lastRoundBroadcastAt = millis();
+        char keyPayload[16];
+        snprintf(keyPayload, sizeof(keyPayload), "KEY:%04X", sessionKey);
+        sendLocalPacket(kMsgBombState, kBroadcastId, keyPayload);
         char payload[16];
         snprintf(payload, sizeof(payload), "START:%lu", static_cast<unsigned long>(seconds));
         sendLocalPacket(kMsgBombState, kBroadcastId, payload);
+        emitGameState("STARTED", difficulty);
+    }
+
+    void finishRound(bool won, const char *reason) {
+        roundActive = false;
+        roundOutcome = won ? 1 : -1;
+        sendLocalPacket(kMsgBombState, kBroadcastId, won ? "END:WIN" : "END:LOSE");
+        emitGameState(won ? "VICTORY" : "DEFEAT", reason);
+    }
+
+    void infectRandomNode() {
+        static constexpr uint8_t eligibleNodes[] = {0, 1, 3, 4};
+        uint8_t available[sizeof(eligibleNodes)]{};
+        uint8_t availableCount = 0;
+        for (uint8_t node : eligibleNodes) {
+            if ((paradoxMask & (1U << node)) == 0) {
+                available[availableCount++] = node;
+            }
+        }
+        if (availableCount == 0) {
+            nextInfectionAt = millis() + nextInfectionDelay();
+            return;
+        }
+        const uint8_t target = available[random(availableCount)];
+        const uint16_t code = static_cast<uint16_t>(sessionKey ^ target);
+        char payload[16];
+        snprintf(payload, sizeof(payload), "INFECT:%04X", code);
+        sendLocalPacket(kMsgParadox, target, payload);
+        nextInfectionAt = millis() + nextInfectionDelay();
+    }
+
+    void updateGame() {
+        if (!roundActive) {
+            return;
+        }
+        const uint32_t now = millis();
+        if (now >= roundDeadline) {
+            finishRound(paradoxMask == 0, paradoxMask == 0 ? "CLEAR_AT_ZERO" : "PARADOX_AT_ZERO");
+            return;
+        }
+        if (now - roundStartedAt >= kRoundStartGraceMs) {
+            static constexpr uint8_t requiredNodes[] = {0, 1, 3, 4};
+            for (uint8_t node : requiredNodes) {
+                if (lastNodeSeenAt[node] == 0 || now - lastNodeSeenAt[node] > kOfflineTimeoutMs) {
+                    finishRound(false, "NODE_OFFLINE");
+                    return;
+                }
+            }
+        }
+        if (now >= nextInfectionAt) {
+            infectRandomNode();
+        }
     }
 
     void startMeshTest() {
@@ -266,6 +378,7 @@ struct TenetFirmware::Impl {
 
     void startIrTest() {
         irTestActive = true;
+        irTestTriggered = false;
         irTestStartedAt = millis();
         Serial.println("{\"event\":\"ir_test\",\"status\":\"waiting\",\"timeout_ms\":15000}");
     }
@@ -343,7 +456,7 @@ struct TenetFirmware::Impl {
         }
         const char *command = document["cmd"] | "";
         if (strcmp(command, "start") == 0) {
-            startBomb(document["seconds"] | 60);
+            startBomb(document["seconds"] | 60, document["difficulty"] | "normal");
         } else if (strcmp(command, "repair") == 0) {
             const uint8_t target = document["target"] | kBroadcastId;
             const char *key = document["key"] | "";
@@ -354,6 +467,8 @@ struct TenetFirmware::Impl {
             startMeshTest();
         } else if (strcmp(command, "test_ir") == 0) {
             startIrTest();
+        } else if (strcmp(command, "ir_state") == 0) {
+            sendLocalPacket(kMsgHeartbeat, kBroadcastId, "IR_STATE?");
         } else if (strcmp(command, "ping") == 0) {
             Serial.println("{\"event\":\"gateway_ready\",\"node\":5}");
         } else {
@@ -368,6 +483,9 @@ struct TenetFirmware::Impl {
         }
         if (role == TenetRole::Gateway) {
             emitPacketJson(frame);
+            if (packet.srcNode < 6 && packet.srcNode != 5) {
+                lastNodeSeenAt[packet.srcNode] = millis();
+            }
             if (packet.msgType == kMsgHeartbeat &&
                 strncmp(packet.payload, "PONG:", 5) == 0 &&
                 packet.srcNode < 6 && meshTestActive) {
@@ -378,22 +496,77 @@ struct TenetFirmware::Impl {
                     meshTestDisplayMask |= 1U << packet.srcNode;
                 }
             }
+            if (packet.msgType == kMsgHeartbeat && packet.srcNode == 4 &&
+                strncmp(packet.payload, "IR_STATE:", 9) == 0) {
+                StaticJsonDocument<128> document;
+                document["event"] = "ir_state";
+                document["level"] = packet.payload + 9;
+                document["raw"] = strcmp(packet.payload + 9, "HIGH") == 0 ? 1 : 0;
+                document["rssi"] = frame.rssi;
+                serializeJson(document, Serial);
+                Serial.println();
+            }
             if (packet.msgType == kMsgInvertTime && packet.srcNode == 4 &&
                 strcmp(packet.payload, "IR_INVERT") == 0 && irTestActive) {
                 finishIrTest(true);
             }
+            if (packet.srcNode < 6 && packet.msgType == kMsgParadox) {
+                paradoxMask |= 1U << packet.srcNode;
+                emitGameState("NODE_PARADOX", packet.payload, packet.srcNode);
+            }
+            if (packet.srcNode < 6 && packet.msgType == kMsgHeartbeat &&
+                strcmp(packet.payload, "REPAIRED") == 0) {
+                paradoxMask &= ~(1U << packet.srcNode);
+                emitGameState("NODE_REPAIRED", nodeRoleName(packet.srcNode), packet.srcNode);
+            }
+            if (packet.srcNode < 6 && packet.msgType == kMsgHeartbeat &&
+                strcmp(packet.payload, "REPAIR_LOCKED") == 0) {
+                emitGameState("REPAIR_REJECTED", nodeRoleName(packet.srcNode), packet.srcNode);
+            }
         }
         if (packet.dstNode == nodeId || packet.dstNode == kBroadcastId) {
-            if (packet.msgType == kMsgInvertTime) {
+            if (packet.msgType == kMsgBombState &&
+                strncmp(packet.payload, "KEY:", 4) == 0) {
+                sessionKey = static_cast<uint16_t>(strtoul(packet.payload + 4, nullptr, 16));
+                hasSessionKey = true;
+            } else if (packet.msgType == kMsgInvertTime) {
+                timeDirection = -timeDirection;
+            } else if (packet.msgType == kMsgBombState &&
+                       strncmp(packet.payload, "START:", 6) == 0) {
+                paradox = false;
+                repairLockUntil = 0;
+                roundOutcome = 0;
                 if (role == TenetRole::TftNormal || role == TenetRole::TftInverse) {
-                    timeDirection = -timeDirection;
+                    bombRemainingSeconds = strtoul(packet.payload + 6, nullptr, 10);
+                    bombStartedAt = millis();
+                    frozenElapsedSeconds = 0;
+                    bombRunning = true;
                 }
             } else if (packet.msgType == kMsgBombState &&
-                       strncmp(packet.payload, "START:", 6) == 0 &&
+                       strncmp(packet.payload, "END:", 4) == 0 &&
                        (role == TenetRole::TftNormal || role == TenetRole::TftInverse)) {
-                bombRemainingSeconds = strtoul(packet.payload + 6, nullptr, 10);
-                bombStartedAt = millis();
-                bombRunning = true;
+                frozenElapsedSeconds = min(bombRemainingSeconds, (millis() - bombStartedAt) / 1000);
+                bombRunning = false;
+                roundOutcome = strcmp(packet.payload + 4, "WIN") == 0 ? 1 : -1;
+            } else if (packet.msgType == kMsgParadox && packet.dstNode == nodeId) {
+                if (strncmp(packet.payload, "INFECT:", 7) == 0) {
+                    const uint16_t code = static_cast<uint16_t>(strtoul(packet.payload + 7, nullptr, 16));
+                    paradox = true;
+                    char report[16];
+                    snprintf(report, sizeof(report), "%04X", code);
+                    sendLocalPacket(kMsgParadox, 5, report);
+                }
+            } else if (packet.msgType == kMsgRepair && packet.dstNode == nodeId) {
+                if (millis() < repairLockUntil) {
+                    sendLocalPacket(kMsgHeartbeat, 5, "REPAIR_LOCKED");
+                } else if (hasSessionKey &&
+                           static_cast<uint16_t>(strtoul(packet.payload, nullptr, 16)) == sessionKey) {
+                    paradox = false;
+                    sendLocalPacket(kMsgHeartbeat, 5, "REPAIRED");
+                } else {
+                    repairLockUntil = millis() + kRepairLockMs;
+                    sendLocalPacket(kMsgHeartbeat, 5, "REPAIR_LOCKED");
+                }
             } else if (packet.msgType == kMsgHeartbeat &&
                        strcmp(packet.payload, "TEST_PING") == 0) {
                 const char *response = "PONG:OK";
@@ -401,6 +574,10 @@ struct TenetFirmware::Impl {
                     response = displayReady ? "PONG:LCD_OK" : "PONG:LCD_FAIL";
                 }
                 sendLocalPacket(kMsgHeartbeat, 5, response);
+            } else if (role == TenetRole::IrGate && packet.msgType == kMsgHeartbeat &&
+                       strcmp(packet.payload, "IR_STATE?") == 0) {
+                sendLocalPacket(kMsgHeartbeat, 5,
+                                digitalRead(kIrRxPin) == HIGH ? "IR_STATE:HIGH" : "IR_STATE:LOW");
             }
         }
     }
@@ -453,7 +630,7 @@ struct TenetFirmware::Impl {
             return;
         }
 
-        uint32_t elapsed = bombRunning ? (now - bombStartedAt) / 1000 : 0;
+        uint32_t elapsed = bombRunning ? (now - bombStartedAt) / 1000 : frozenElapsedSeconds;
         if (elapsed > bombRemainingSeconds) {
             elapsed = bombRemainingSeconds;
         }
@@ -468,9 +645,29 @@ struct TenetFirmware::Impl {
         canvas.setTextColor(TFT_WHITE);
         canvas.setFont(&fonts::Font8);
         canvas.drawCenterString(String(value), 160, 112);
+        if (hasSessionKey) {
+            char fragment[12];
+            const uint8_t keyByte = role == TenetRole::TftNormal
+                ? static_cast<uint8_t>(sessionKey >> 8)
+                : static_cast<uint8_t>(sessionKey & 0xFF);
+            snprintf(fragment, sizeof(fragment), "KEY %02X", keyByte);
+            canvas.setTextColor(TFT_YELLOW);
+            canvas.setFont(&fonts::Font2);
+            canvas.drawCenterString(fragment, 160, 158);
+        }
+        if (paradox) {
+            canvas.fillCircle(292, 24, 10, TFT_YELLOW);
+            canvas.setTextColor(TFT_BLACK);
+            canvas.setFont(&fonts::Font2);
+            canvas.drawCenterString("!", 292, 15);
+        }
         canvas.setTextColor(timeDirection < 0 ? TFT_RED : TFT_GREEN);
         canvas.setFont(&fonts::Font4);
-        canvas.drawCenterString(timeDirection < 0 ? "INVERSE" : "NORMAL", 160, 182);
+        const char *stateText = paradox ? "PARADOX"
+            : (roundOutcome > 0 ? "DEFUSED" : (roundOutcome < 0 ? "FAILED"
+                : (timeDirection < 0 ? "INVERSE" : "NORMAL")));
+        canvas.setTextColor(paradox ? TFT_YELLOW : (roundOutcome < 0 ? TFT_RED : (timeDirection < 0 ? TFT_RED : TFT_GREEN)));
+        canvas.drawCenterString(stateText, 160, 190);
         canvas.setTextColor(TFT_YELLOW);
         canvas.setFont(&fonts::Font2);
         canvas.drawCenterString(bombRunning ? "BOMB ACTIVE" : "WAITING FOR START",
@@ -506,7 +703,7 @@ struct TenetFirmware::Impl {
         }
         setupRadio();
         if (role == TenetRole::IrGate) {
-            irReceiver.enableIRIn();
+            pinMode(kIrRxPin, INPUT);
         } else if (role == TenetRole::TftNormal || role == TenetRole::TftInverse) {
             displayReady = display.init();
             display.setRotation(1);
@@ -549,17 +746,19 @@ struct TenetFirmware::Impl {
     }
 
     void updateIrGate() {
-        if (!irReceiver.decode(&irResults)) {
-            return;
-        }
+        const int inputState = digitalRead(kIrRxPin);
         const uint32_t now = millis();
-        if (irResults.value == kIrNecCode &&
-            (!irHasTriggered || now - lastIrTriggerAt >= kIrCooldownMs)) {
+        const bool risingEdge = inputState == HIGH && lastIrInputState == LOW;
+        lastIrInputState = inputState;
+        const bool canTrigger = irTestActive
+            ? !irTestTriggered
+            : (!irHasTriggered || now - lastIrTriggerAt >= kIrCooldownMs);
+        if (risingEdge && canTrigger) {
             lastIrTriggerAt = now;
             irHasTriggered = true;
+            irTestTriggered = irTestActive;
             sendLocalPacket(kMsgInvertTime, kBroadcastId, "IR_INVERT");
         }
-        irReceiver.resume();
     }
 
     void update() {
@@ -569,6 +768,7 @@ struct TenetFirmware::Impl {
         }
         if (role == TenetRole::Gateway) {
             updateGatewaySerial();
+            updateGame();
             const uint32_t now = millis();
             if (meshTestActive) {
                 if (now - meshTestLastPingAt >= kMeshTestRetryMs) {
