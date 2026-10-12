@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+import csv
 import queue
 import threading
 import time
 import tkinter as tk
 from datetime import datetime
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Any
+
+from protocol import GatewayEvent, decode_line, encode_command, packet_status
+from game_rules import IrConfig, MissionConfig, calculate_score
 
 try:
     import serial
@@ -42,22 +46,6 @@ NODE_ROLES = {
 MESH_NODE_IDS = (0, 1, 3, 4, 5)
 
 
-def encode_command(command: str, **values: Any) -> bytes:
-    """Encode one newline-delimited command in the Gateway's JSON format."""
-    payload = {"cmd": command, **values}
-    return (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
-
-
-def decode_line(line: bytes | str) -> dict[str, Any] | None:
-    """Decode one Gateway JSON line; ignore malformed/non-object lines."""
-    try:
-        text = line.decode("utf-8", errors="replace") if isinstance(line, bytes) else line
-        value = json.loads(text.strip())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return None
-    return value if isinstance(value, dict) else None
-
-
 class SerialWorker:
     def __init__(self, port: str, baud: int, events: queue.Queue[tuple[str, Any]]):
         self.port_name = port
@@ -81,7 +69,7 @@ class SerialWorker:
                 line = self.serial_port.readline()
                 if line:
                     self.events.put(("line", line))
-            except Exception as error:  # serial driver exceptions vary by OS
+            except Exception as error:
                 if not self.stop_event.is_set():
                     self.events.put(("error", str(error)))
                 break
@@ -104,14 +92,14 @@ class SerialWorker:
 class TenetControlApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("TENET MESH  /  Control Room")
-        self.root.geometry("1220x820")
-        self.root.minsize(980, 680)
+        self.root.title("TENET MESH / Network Recovery")
+        self.root.geometry("1260x860")
+        self.root.minsize(1040, 700)
         self.root.configure(bg=COLORS["bg"])
-
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.worker: SerialWorker | None = None
-        self.nodes: dict[int, dict[str, Any]] = {
+
+        self.nodes = {
             node_id: {
                 "role": NODE_ROLES[node_id],
                 "online": node_id == 2,
@@ -119,30 +107,65 @@ class TenetControlApp:
                 "direction": 1,
                 "paradox": False,
                 "last_seen": None,
+                "communication_state": "UNKNOWN",
+                "game_state": "UNKNOWN",
+                "firmware": "UNKNOWN",
+                "capabilities": [],
+                "last_seen_wall": None,
             }
             for node_id in NODE_ROLES
         }
         self.nodes[2]["online"] = False
+        self.nodes[2]["communication_state"] = "STANDALONE"
         self.gateway_connected = False
+        self.gateway_ready = False
         self.test_results: dict[int, dict[str, Any]] = {}
         self.test_running = False
         self.mesh_ready = False
         self.game_running = False
         self.game_deadline = 0.0
-        self.countdown_seconds = tk.IntVar(value=60)
+        self.countdown_seconds = tk.IntVar(value=240)
         self.difficulty = tk.StringVar(value="Normal")
+        self.required_packets = tk.IntVar(value=8)
+        self.fault_interval = tk.IntVar(value=12)
+        self.fault_intensity = tk.IntVar(value=2)
+        self.mission_id = tk.IntVar(value=(int(time.time()) & 0xFFFF) or 1)
+        self.packet_target = tk.IntVar(value=0)
+        self.repair_target = tk.IntVar(value=0)
+        self.mission_state_text = tk.StringVar(value="DISCOVERY")
+        self.mission_progress_text = tk.StringVar(value="PACKETS 0 / 8     ERRORS 0")
+        self.ir_active_high = tk.BooleanVar(value=True)
+        self.ir_gap_ms = tk.IntVar(value=80)
+        self.ir_short_min = tk.IntVar(value=100)
+        self.ir_short_max = tk.IntVar(value=400)
+        self.ir_medium_min = tk.IntVar(value=500)
+        self.ir_medium_max = tk.IntVar(value=1200)
+        self.ir_long_min = tk.IntVar(value=1300)
+        self.ir_long_max = tk.IntVar(value=2500)
+        self.ir_minimum_ms = tk.IntVar(value=50)
+        self.ir_maximum_ms = tk.IntVar(value=3000)
+        self.ir_cooldown_ms = tk.IntVar(value=800)
+        self.ir_measurement_text = tk.StringVar(value="NO MEASUREMENT")
+        self.packet_records: list[dict[str, Any]] = []
+        self.packet_type_filter = tk.StringVar(value="ALL")
+        self.packet_status_filter = tk.StringVar(value="ALL")
+        self.packet_node_filter = tk.StringVar(value="ALL")
         self.target_node = tk.IntVar(value=0)
         self.port_var = tk.StringVar()
         self.baud_var = tk.StringVar(value="2000000")
         self.connection_text = tk.StringVar(value="DISCONNECTED")
         self.status_text = tk.StringVar(value="Gatewayhez kapcsolódás szükséges")
         self.ir_state_text = tk.StringVar(value="IR INPUT  /  UNKNOWN")
+        self.ir_verified_at: float | None = None
+        self.ir_config_ready = False
+        self.ir_capture_active = False
 
         self._configure_styles()
         self._build_ui()
         self.refresh_ports()
         self.root.after(80, self._drain_events)
         self.root.after(500, self._refresh_node_states)
+        self.root.after(2000, self._send_host_heartbeat)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
     def _configure_styles(self) -> None:
@@ -225,11 +248,17 @@ class TenetControlApp:
         self.notebook = ttk.Notebook(mode_panel)
         self.notebook.pack(fill="both", expand=True)
         self.test_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=16)
-        self.game_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=16)
+        self.lobby_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=16)
+        self.mission_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=16)
+        self.ir_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=16)
+        self.notebook.add(self.lobby_tab, text="LOBBY")
+        self.notebook.add(self.mission_tab, text="MISSION")
         self.notebook.add(self.test_tab, text="TEST MODE")
-        self.notebook.add(self.game_tab, text="GAME MODE")
+        self.notebook.add(self.ir_tab, text="IR CALIBRATION")
+        self._build_lobby_tab()
+        self._build_mission_tab()
         self._build_test_tab()
-        self._build_game_tab()
+        self._build_ir_tab()
 
         log_panel = ttk.Frame(self.root, style="Panel.TFrame", padding=12)
         log_panel.grid(row=3, column=0, sticky="nsew", padx=18, pady=(12, 0))
@@ -238,22 +267,243 @@ class TenetControlApp:
         log_header = ttk.Frame(log_panel, style="Panel.TFrame")
         log_header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         ttk.Label(log_header, text="PACKET / EVENT STREAM", style="PanelTitle.TLabel").pack(side="left")
+        ttk.Combobox(log_header, textvariable=self.packet_node_filter, values=("ALL", "0", "1", "3", "4", "5"), width=5, state="readonly").pack(side="right", padx=(4, 0))
+        ttk.Combobox(log_header, textvariable=self.packet_status_filter, values=("ALL", "SENT", "ACK", "LOST", "RETRY", "INVALID", "DUPLICATE", "UNKNOWN"), width=10, state="readonly").pack(side="right", padx=(4, 0))
+        ttk.Combobox(log_header, textvariable=self.packet_type_filter, values=("ALL", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"), width=6, state="readonly").pack(side="right", padx=(4, 0))
+        ttk.Button(log_header, text="EXPORT", command=self.export_log).pack(side="right", padx=(5, 0))
         ttk.Button(log_header, text="CLEAR", command=self.clear_log).pack(side="right")
-        columns = ("time", "src", "dst", "type", "id", "dir", "rssi", "payload")
+        for variable in (self.packet_type_filter, self.packet_status_filter, self.packet_node_filter):
+            variable.trace_add("write", lambda *_args: self._render_packet_log())
+        columns = ("time", "msg", "logical", "mission", "src", "dst", "type", "status", "retry", "latency", "rssi", "payload")
         self.packet_tree = ttk.Treeview(log_panel, columns=columns, show="headings", height=8)
-        widths = {"time": 88, "src": 42, "dst": 42, "type": 54, "id": 60, "dir": 45, "rssi": 58, "payload": 280}
-        for column, label in zip(columns, ("TIME", "SRC", "DST", "TYPE", "ID", "DIR", "RSSI", "PAYLOAD")):
+        widths = {"time": 70, "msg": 48, "logical": 55, "mission": 55, "src": 34, "dst": 34, "type": 48, "status": 66, "retry": 38, "latency": 55, "rssi": 48, "payload": 170}
+        for column, label in zip(columns, ("TIME", "MSG", "PACKET", "MISSION", "SRC", "DST", "TYPE", "STATUS", "RETRY", "LATENCY", "RSSI", "PAYLOAD")):
             self.packet_tree.heading(column, text=label)
             self.packet_tree.column(column, width=widths[column], anchor="w", stretch=column == "payload")
         self.packet_tree.grid(row=1, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(log_panel, orient="vertical", command=self.packet_tree.yview)
         scrollbar.grid(row=1, column=1, sticky="ns")
-        self.packet_tree.configure(yscrollcommand=scrollbar.set)
+        horizontal = ttk.Scrollbar(log_panel, orient="horizontal", command=self.packet_tree.xview)
+        horizontal.grid(row=2, column=0, sticky="ew")
+        self.packet_tree.configure(yscrollcommand=scrollbar.set, xscrollcommand=horizontal.set)
 
         footer = tk.Frame(self.root, bg=COLORS["bg"], padx=20, pady=8)
         footer.grid(row=4, column=0, sticky="ew")
         tk.Label(footer, textvariable=self.status_text, bg=COLORS["bg"], fg=COLORS["muted"], font=("Segoe UI", 9)).pack(side="left")
         tk.Label(footer, text="ESP-NOW  /  CHANNEL 1  /  JSON-LINE", bg=COLORS["bg"], fg=COLORS["muted"], font=("Cascadia Mono", 8)).pack(side="right")
+
+    def _build_lobby_tab(self) -> None:
+        self.lobby_tab.grid_columnconfigure(0, weight=1)
+        header = ttk.Frame(self.lobby_tab, style="Panel.TFrame")
+        header.grid(row=0, column=0, sticky="ew")
+        ttk.Label(header, text="SYSTEM LOBBY", style="PanelTitle.TLabel").pack(side="left")
+        ttk.Label(header, textvariable=self.mission_state_text, style="Muted.TLabel").pack(side="right")
+        ttk.Label(self.lobby_tab, text="Firmware-reported inventory; IR remote is standalone and has no mesh heartbeat.", style="Muted.TLabel", wraplength=405).grid(row=1, column=0, sticky="w", pady=(5, 10))
+        columns = ("node", "role", "comm", "game", "firmware", "last")
+        self.node_tree = ttk.Treeview(self.lobby_tab, columns=columns, show="headings", height=7)
+        for name, label, width in (("node", "ID", 35), ("role", "ROLE", 105), ("comm", "LINK", 72), ("game", "STATE", 76), ("firmware", "FIRMWARE", 80), ("last", "LAST SEEN", 68)):
+            self.node_tree.heading(name, text=label)
+            self.node_tree.column(name, width=width, anchor="w")
+        for node_id, role in NODE_ROLES.items():
+            comm_state = "STANDALONE" if node_id == 2 else "UNKNOWN"
+            self.node_tree.insert("", "end", iid=str(node_id), values=(node_id, role, comm_state, "UNKNOWN", "--", "--"))
+        self.node_tree.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        buttons = ttk.Frame(self.lobby_tab, style="Panel.TFrame")
+        buttons.grid(row=3, column=0, sticky="ew")
+        ttk.Button(buttons, text="SCAN / REFRESH", command=self.scan_nodes).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="HARDWARE TEST", command=lambda: self.notebook.select(self.test_tab)).pack(side="left", padx=6)
+        ttk.Button(buttons, text="CALIBRATE IR", command=lambda: self.notebook.select(self.ir_tab)).pack(side="left", padx=6)
+        self.lobby_ready_text = ttk.Label(self.lobby_tab, text="Required mesh nodes: 0 / 5", style="Muted.TLabel")
+        self.lobby_ready_text.grid(row=4, column=0, sticky="w", pady=(10, 0))
+
+    def _build_mission_tab(self) -> None:
+        self.mission_tab.grid_columnconfigure(0, weight=1)
+        ttk.Label(self.mission_tab, text="NETWORK RECOVERY", style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(self.mission_tab, text="A gateway visszaigazolásai vezérlik az állapotot; csak ACK-olt adat számít kézbesítettnek.", style="Muted.TLabel", wraplength=405).grid(row=1, column=0, sticky="w", pady=(5, 11))
+
+        self.fault_vars = {fault: tk.BooleanVar(value=fault in ("INVERSE", "PARADOX", "LOSS", "DELAY")) for fault in ("INVERSE", "PARADOX", "LOSS", "DELAY", "DUPLICATE", "INVALID_PAYLOAD")}
+        fields = ttk.Frame(self.mission_tab, style="Panel.TFrame")
+        fields.grid(row=2, column=0, sticky="ew")
+        for col in (1, 3):
+            fields.grid_columnconfigure(col, weight=1)
+        ttk.Label(fields, text="DIFFICULTY", style="Muted.TLabel").grid(row=0, column=0, sticky="w", pady=3)
+        difficulty = ttk.Combobox(fields, values=("Easy", "Normal", "Hard"), textvariable=self.difficulty, state="readonly", width=12)
+        difficulty.grid(row=0, column=1, sticky="ew", padx=5)
+        difficulty.bind("<<ComboboxSelected>>", self._apply_difficulty_defaults)
+        for row, title, variable, low, high in (
+            (1, "MISSION ID", self.mission_id, 1, 65535),
+            (2, "TIME (SEC)", self.countdown_seconds, 30, 3600),
+            (3, "REQUIRED PACKETS", self.required_packets, 1, 100),
+            (4, "FAULT INTERVAL (SEC)", self.fault_interval, 2, 300),
+            (5, "FAULT INTENSITY", self.fault_intensity, 1, 5),
+        ):
+            ttk.Label(fields, text=title, style="Muted.TLabel").grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Spinbox(fields, from_=low, to=high, textvariable=variable, width=10, justify="right").grid(row=row, column=1, sticky="ew", padx=5, pady=3)
+            ttk.Label(fields, text="PACKET TARGET", style="Muted.TLabel").grid(row=6, column=0, sticky="w", pady=3)
+            ttk.Combobox(fields, values=(0, 1, 3, 4), textvariable=self.packet_target,
+                     width=10, state="readonly").grid(row=6, column=1, sticky="ew", padx=5, pady=3)
+        ttk.Label(self.mission_tab, text="ENABLED FAULTS", style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=(10, 3))
+        faults = ttk.Frame(self.mission_tab, style="Panel.TFrame")
+        faults.grid(row=4, column=0, sticky="ew")
+        for index, fault in enumerate(self.fault_vars):
+            ttk.Checkbutton(faults, text=fault.replace("_", " "), variable=self.fault_vars[fault]).grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 12), pady=2)
+        controls = ttk.Frame(self.mission_tab, style="Panel.TFrame")
+        controls.grid(row=5, column=0, sticky="ew", pady=(12, 0))
+        ttk.Button(controls, text="START MISSION", style="Primary.TButton", command=self.start_mission).pack(side="left", padx=(0, 5))
+        ttk.Button(controls, text="PAUSE / RESUME", command=self.toggle_pause).pack(side="left", padx=5)
+        ttk.Button(controls, text="ABORT", style="Danger.TButton", command=self.abort_mission).pack(side="left", padx=5)
+        ttk.Label(self.mission_tab, textvariable=self.mission_progress_text, style="Metric.TLabel").grid(row=6, column=0, sticky="w", pady=(11, 0))
+        repair_row = ttk.Frame(self.mission_tab, style="Panel.TFrame")
+        repair_row.grid(row=7, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(repair_row, text="REPAIR FAULT NODE", style="Muted.TLabel").pack(side="left")
+        ttk.Combobox(repair_row, values=(0, 1, 3, 4), textvariable=self.repair_target, width=5, state="readonly").pack(side="left", padx=8)
+        ttk.Button(repair_row, text="SEND REPAIR", command=self.repair_selected_node).pack(side="right")
+
+    def _apply_difficulty_defaults(self, _event: Any = None) -> None:
+        try:
+            config = MissionConfig.for_difficulty(self.difficulty.get())
+        except ValueError:
+            return
+        self.countdown_seconds.set(config.duration_seconds)
+        self.required_packets.set(config.required_packets)
+        self.fault_interval.set(config.fault_interval_seconds)
+
+    def _build_ir_tab(self) -> None:
+        self.ir_tab.grid_columnconfigure(0, weight=1)
+        ttk.Label(self.ir_tab, text="IR CALIBRATION", style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(self.ir_tab, text="HIGH/LOW időmérés; a beállítás csak a Gateway jóváhagyása után lép életbe.", style="Muted.TLabel", wraplength=405).grid(row=1, column=0, sticky="w", pady=(5, 10))
+        ttk.Label(self.ir_tab, textvariable=self.ir_measurement_text, style="Metric.TLabel").grid(row=2, column=0, sticky="w", pady=(0, 8))
+        self.ir_raw_text = tk.StringVar(value="RAW --    ACTIVE --    PULSE -- ms    GAP -- ms    GROUP -- ms    CATEGORY --")
+        ttk.Label(self.ir_tab, textvariable=self.ir_raw_text, style="Muted.TLabel", wraplength=410).grid(row=3, column=0, sticky="w", pady=(0, 10))
+        ttk.Checkbutton(self.ir_tab, text="Input active HIGH (disable for active LOW)", variable=self.ir_active_high).grid(row=4, column=0, sticky="w", pady=3)
+        config = ttk.Frame(self.ir_tab, style="Panel.TFrame")
+        config.grid(row=5, column=0, sticky="ew")
+        items = (
+            ("Pulse group gap ms", self.ir_gap_ms), ("Short min ms", self.ir_short_min), ("Short max ms", self.ir_short_max),
+            ("Medium min ms", self.ir_medium_min), ("Medium max ms", self.ir_medium_max), ("Long min ms", self.ir_long_min),
+            ("Long max ms", self.ir_long_max), ("Minimum active ms", self.ir_minimum_ms), ("Maximum group ms", self.ir_maximum_ms),
+            ("Cooldown ms", self.ir_cooldown_ms),
+        )
+        for index, (label, variable) in enumerate(items):
+            row, column = divmod(index, 2)
+            ttk.Label(config, text=label, style="Muted.TLabel").grid(row=row, column=column * 2, sticky="w", pady=2, padx=(0, 3))
+            ttk.Spinbox(config, from_=0, to=10000, textvariable=variable, width=7, justify="right").grid(row=row, column=column * 2 + 1, sticky="ew", padx=(0, 10), pady=2)
+        controls = ttk.Frame(self.ir_tab, style="Panel.TFrame")
+        controls.grid(row=6, column=0, sticky="ew", pady=(10, 3))
+        ttk.Button(controls, text="READ INPUT", command=self.query_ir_state).pack(side="left", padx=(0, 5))
+        self.ir_capture_button = ttk.Button(controls, text="START CAPTURE", command=self.toggle_ir_capture)
+        self.ir_capture_button.pack(side="left", padx=5)
+        ttk.Button(self.ir_tab, text="APPLY IR CONFIG", command=self.apply_ir_config).grid(row=7, column=0, sticky="ew", pady=(5, 3))
+
+    def scan_nodes(self) -> None:
+        self._send("scan")
+        self.status_text.set("Node discovery kérés elküldve")
+
+    def start_mission(self) -> None:
+        try:
+            config = MissionConfig(
+                self.difficulty.get().lower(),
+                int(self.countdown_seconds.get()),
+                int(self.fault_interval.get()),
+                int(self.required_packets.get()),
+                tuple(name for name, variable in self.fault_vars.items() if variable.get()),
+                int(self.fault_intensity.get()),
+            )
+            config.validate()
+            mission_id = int(self.mission_id.get())
+            if not 1 <= mission_id <= 65535:
+                raise ValueError("Mission ID must be 1..65535")
+        except (ValueError, tk.TclError) as error:
+            messagebox.showwarning("Mission configuration", str(error))
+            return
+        if not self.gateway_connected or not self.gateway_ready:
+            messagebox.showwarning("Gateway", "Csatlakozz az USB gatewayhez a küldetés indításához.")
+            return
+        if not self.mesh_ready:
+            messagebox.showwarning("Preflight", "A küldetés előtt futtasd le sikeresen a kötelező hardware/mesh teszteket.")
+            self.notebook.select(self.test_tab)
+            return
+        stale_nodes = [node_id for node_id in (0, 1, 3, 4)
+                       if not self.nodes[node_id]["online"] or self.nodes[node_id]["last_seen"] is None
+                       or time.monotonic() - self.nodes[node_id]["last_seen"] > 6
+                       or self.nodes[node_id]["firmware"] == "UNKNOWN"]
+        if stale_nodes:
+            messagebox.showwarning("Preflight", f"Elavult/offline node: {', '.join(map(str, stale_nodes))}. Futtasd újra a scan-t.")
+            self.notebook.select(self.lobby_tab)
+            return
+        if self.ir_verified_at is None or time.monotonic() - self.ir_verified_at > 10:
+            messagebox.showwarning("IR preflight", "Kérd le most az IR bemenetet az IR Calibration fülön.")
+            self.notebook.select(self.ir_tab)
+            return
+        if not self.ir_config_ready:
+            messagebox.showwarning("IR configuration", "Az IR beállítás még nincs visszaigazolva a firmware-től.")
+            self.notebook.select(self.ir_tab)
+            return
+        self.mission_state_text.set("COUNTDOWN REQUESTED")
+        self._send("mission_start", mission_id=mission_id, difficulty=config.difficulty,
+                   duration_seconds=config.duration_seconds, packet_count=config.required_packets,
+                   fault_interval_seconds=config.fault_interval_seconds,
+                   packet_target=int(self.packet_target.get()),
+                   fault_intensity=config.fault_intensity, fault_types=list(config.enabled_faults))
+
+    def toggle_pause(self) -> None:
+        command = "mission_resume" if self.mission_state_text.get() == "PAUSED" else "mission_pause"
+        self._send(command)
+
+    def abort_mission(self) -> None:
+        if messagebox.askyesno("Abort mission", "Biztosan megszakítod a küldetést?"):
+            self._send("mission_abort")
+
+    def repair_selected_node(self) -> None:
+        node_id = int(self.repair_target.get())
+        node = self.nodes[node_id]
+        if node["game_state"] not in {"INVERSE", "PARADOX", "LOSS", "DELAY", "DUPLICATE", "INVALID_PAYLOAD"}:
+            messagebox.showwarning("Repair", f"N{node_id} nem jelentett javítható hibát.")
+            return
+        self._send("repair", target=node_id)
+
+    def apply_ir_config(self) -> None:
+        try:
+            config = IrConfig(
+                self.ir_active_high.get(), int(self.ir_gap_ms.get()),
+                int(self.ir_short_min.get()), int(self.ir_short_max.get()),
+                int(self.ir_medium_min.get()), int(self.ir_medium_max.get()),
+                int(self.ir_long_min.get()), int(self.ir_long_max.get()),
+                int(self.ir_minimum_ms.get()), int(self.ir_maximum_ms.get()),
+                int(self.ir_cooldown_ms.get()),
+            )
+            config.validate()
+        except (ValueError, tk.TclError) as error:
+            messagebox.showwarning("IR configuration", str(error))
+            return
+        values = {name: getattr(config, name) for name in config.__dataclass_fields__}
+        if messagebox.askyesno("Apply IR configuration", json.dumps(values, indent=2)):
+            self.ir_config_ready = False
+            self._send("ir_config", **values)
+
+    def toggle_ir_capture(self) -> None:
+        command = "ir_calibration_stop" if self.ir_capture_active else "ir_calibrate"
+        self._send(command)
+
+    def export_log(self) -> None:
+        filename = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=(("CSV", "*.csv"), ("JSON", "*.json")))
+        if not filename:
+            return
+        rows = [self.packet_tree.item(item, "values") for item in self.packet_tree.get_children()]
+        headings = [self.packet_tree.heading(column, "text") for column in self.packet_tree["columns"]]
+        try:
+            if filename.lower().endswith(".json"):
+                with open(filename, "w", encoding="utf-8") as output:
+                    json.dump([dict(zip(headings, row)) for row in rows], output, ensure_ascii=False, indent=2)
+            else:
+                with open(filename, "w", encoding="utf-8", newline="") as output:
+                    writer = csv.writer(output)
+                    writer.writerow(headings)
+                    writer.writerows(rows)
+        except OSError as error:
+            messagebox.showerror("Export", str(error))
+            return
+        self.status_text.set(f"Napló exportálva: {filename}")
 
     def _build_test_tab(self) -> None:
         self.test_tab.grid_columnconfigure(0, weight=1)
@@ -348,12 +598,17 @@ class TenetControlApp:
         self.gateway_connected = connected
         if not connected:
             self.mesh_ready = False
-        self.connection_text.set("GATEWAY ONLINE" if connected else "DISCONNECTED")
-        self.link_led.itemconfigure(self.link_dot, fill=COLORS["lime"] if connected else COLORS["offline"])
+            self.gateway_ready = False
+        link_text = "DISCONNECTED" if not connected else "GATEWAY ONLINE" if self.gateway_ready else "WAITING FOR GATEWAY"
+        self.connection_text.set(link_text)
+        self.link_led.itemconfigure(self.link_dot, fill=COLORS["lime"] if self.gateway_ready else COLORS["yellow"] if connected else COLORS["offline"])
         self.connect_button.configure(text="DISCONNECT" if connected else "CONNECT", style="Danger.TButton" if connected else "Primary.TButton")
-        if connected:
-            self.nodes[5]["online"] = True
+        self.nodes[5]["online"] = self.gateway_ready
+        self.nodes[5]["communication_state"] = "ONLINE" if self.gateway_ready else "DISCOVERING"
+        if self.gateway_ready:
             self.nodes[5]["last_seen"] = time.monotonic()
+            self.nodes[5]["last_seen_wall"] = datetime.now()
+        self._update_lobby_node(5)
         self.draw_map()
 
     def _send(self, command: str, **values: Any) -> bool:
@@ -387,49 +642,6 @@ class TenetControlApp:
         self.ir_state_text.set("IR INPUT  /  WAITING")
         self._send("ir_state")
 
-    def start_round(self) -> None:
-        try:
-            seconds = int(self.countdown_seconds.get())
-            if not 1 <= seconds <= 3600:
-                raise ValueError
-        except (ValueError, tk.TclError):
-            messagebox.showwarning("Countdown", "1 és 3600 másodperc közötti értéket adj meg.")
-            return
-        if not self.gateway_connected:
-            self._send("start", seconds=seconds)
-            return
-        if not self.mesh_ready:
-            messagebox.showwarning("Mesh preflight", "Előbb futtasd sikeresen a mesh tesztet (4/4 node és TFT init PASS).")
-            return
-        if not self._send("start", seconds=seconds, difficulty=self.difficulty.get().lower()):
-            return
-        self.game_running = False
-        self.game_clock.configure(text="ARMING ROUND")
-        self.status_text.set("Gateway visszaigazolására vár")
-
-    def _tick_game_clock(self) -> None:
-        if not self.game_running:
-            return
-        remaining = max(0, int(self.game_deadline - time.monotonic() + 0.999))
-        self.game_clock.configure(text=f"LIVE  /  00:{remaining:02d}")
-        if remaining == 0:
-            self.game_running = False
-            self.game_clock.configure(text="ROUND CHECK  /  00:00")
-            self.status_text.set("A Gateway kiértékeli a kör eredményét")
-        else:
-            self.root.after(200, self._tick_game_clock)
-
-    def invert_time(self) -> None:
-        self._send("invert")
-
-    def send_repair(self) -> None:
-        key = self.key_entry.get().strip()
-        if not key:
-            messagebox.showwarning("Repair key", "Add meg a kulcsot a parancs elküldéséhez.")
-            return
-        self._send("repair", target=self.target_node.get(), key=key)
-        self.key_entry.delete(0, "end")
-
     def _drain_events(self) -> None:
         while True:
             try:
@@ -446,6 +658,11 @@ class TenetControlApp:
                 self._set_connected(False)
         self.root.after(80, self._drain_events)
 
+    def _send_host_heartbeat(self) -> None:
+        if self.gateway_connected:
+            self._send("host_heartbeat")
+        self.root.after(2000, self._send_host_heartbeat)
+
     def _handle_line(self, raw_line: bytes) -> None:
         message = decode_line(raw_line)
         if message is None:
@@ -453,7 +670,63 @@ class TenetControlApp:
             return
         event = message.get("event")
         if event == "gateway_ready":
+            self.gateway_ready = True
+            self.connection_text.set("GATEWAY ONLINE")
+            self.link_led.itemconfigure(self.link_dot, fill=COLORS["lime"])
+            self.nodes[5]["online"] = True
+            self.nodes[5]["communication_state"] = "ONLINE"
+            self.nodes[5]["firmware"] = message.get("firmware", "UNKNOWN")
+            self.nodes[5]["last_seen"] = time.monotonic()
+            self.nodes[5]["last_seen_wall"] = datetime.now()
+            self._update_lobby_node(5)
+            self.draw_map()
             self.status_text.set("Gateway válaszolt a pingre")
+        elif event == GatewayEvent.HELLO:
+            node_id = message.get("node")
+            if isinstance(node_id, int) and node_id in self.nodes:
+                node = self.nodes[node_id]
+                node["firmware"] = message.get("firmware", "UNKNOWN")
+                node["communication_state"] = "ONLINE"
+                node["online"] = True
+                node["last_seen"] = time.monotonic()
+                node["last_seen_wall"] = datetime.now()
+                self._update_lobby_node(node_id)
+                self.draw_map()
+        elif event == GatewayEvent.NODE_STATUS:
+            node_id = message.get("node")
+            if isinstance(node_id, int) and node_id in self.nodes:
+                node = self.nodes[node_id]
+                node["communication_state"] = message.get("communication_state", "UNKNOWN")
+                node["game_state"] = message.get("game_state", "UNKNOWN")
+                node["online"] = node["communication_state"] == "ONLINE"
+                node["rssi"] = message.get("rssi")
+                node["last_seen"] = time.monotonic()
+                node["last_seen_wall"] = datetime.now()
+                node["paradox"] = node["game_state"] == "PARADOX"
+                self._update_lobby_node(node_id)
+                self.draw_map()
+        elif event == GatewayEvent.PACKET:
+            self._handle_packet(message)
+        elif event == GatewayEvent.PACKET_RESULT:
+            self._handle_packet_result(message)
+        elif event == GatewayEvent.MISSION_STATE:
+            self._handle_mission_state(message)
+        elif event == GatewayEvent.MISSION_RESULT:
+            self._handle_mission_result(message)
+        elif event == "ir_config_result":
+            status = message.get("status", "UNKNOWN")
+            self.ir_config_ready = status == "OK"
+            self.status_text.set(f"IR config: {status}")
+            messagebox.showinfo("IR calibration", f"Gateway result: {status}")
+        elif event == "ir_calibration":
+            status = message.get("status", "UNKNOWN")
+            self.ir_capture_active = status in ("CAPTURE_STARTED", "IR_CAPTURE_READY")
+            self.ir_capture_button.configure(text="STOP CAPTURE" if self.ir_capture_active else "START CAPTURE")
+            self.status_text.set(f"IR capture: {status}")
+        elif event == "ir_action_result":
+            self.status_text.set(f"IR {message.get('category', 'UNKNOWN')}: {message.get('status', 'UNKNOWN')}")
+        elif event == GatewayEvent.IR_SAMPLE:
+            self._handle_ir_sample(message)
         elif event == "mesh_test_node":
             node_id = message.get("node")
             if isinstance(node_id, int):
@@ -474,44 +747,79 @@ class TenetControlApp:
             self.status_text.set(f"IR útvonal teszt: {status}")
         elif event == "ir_state":
             level = message.get("level", "UNKNOWN")
+            self.ir_verified_at = time.monotonic()
             self.ir_state_text.set(f"IR INPUT  /  {level}")
             self.status_text.set(f"IR_GATE input: {level} ({message.get('rssi', '?')} dBm)")
-        elif event == "game_state":
-            self._handle_game_state(message)
-        elif event is None and "src" in message:
-            self._handle_packet(message)
         elif "error" in message:
             self.status_text.set(f"Gateway hiba: {message['error']}")
         self._append_log(message)
 
-    def _handle_game_state(self, event: dict[str, Any]) -> None:
-        state = event.get("state")
+    def _update_lobby_node(self, node_id: int) -> None:
+        node = self.nodes[node_id]
+        seen_at = node.get("last_seen_wall")
+        last_seen = seen_at.strftime("%H:%M:%S") if seen_at is not None else "--"
+        if str(node_id) in self.node_tree.get_children(""):
+            self.node_tree.item(str(node_id), values=(
+                node_id, node["role"], node["communication_state"], node["game_state"],
+                node["firmware"], last_seen,
+            ))
+        online = sum(self.nodes[item]["online"] for item in (0, 1, 3, 4, 5))
+        self.lobby_ready_text.configure(text=f"Mesh nodes online: {online} / 5    IR remote: standalone")
+
+    def _handle_packet_result(self, event: dict[str, Any]) -> None:
+        delivery = event.get("delivery_status", "UNKNOWN")
+        if delivery == "ACK":
+            self.status_text.set(f"Packet {event.get('logical_packet_id')} kézbesítve / ACK")
+        elif delivery in ("LOST", "INVALID", "DUPLICATE"):
+            self.status_text.set(f"Packet eredmény: {delivery}")
+
+    def _handle_mission_state(self, event: dict[str, Any]) -> None:
+        state = event.get("state", "UNKNOWN")
+        event_type = event.get("event_type", state)
+        self.mission_state_text.set(state)
+        delivered = event.get("delivered_packets", 0)
+        required = event.get("required_packets", self.required_packets.get())
+        faults = event.get("active_faults", 0)
+        remaining = event.get("remaining_seconds")
+        time_text = "" if remaining is None else f"     TIME {int(remaining) // 60:02}:{int(remaining) % 60:02}"
+        self.mission_progress_text.set(f"PACKETS {delivered} / {required}     ERRORS {faults}{time_text}")
+        self.status_text.set(f"Mission {event.get('mission_id', '--')}: {event_type} / {event.get('detail', '')}")
         node_id = event.get("node")
-        if state == "STARTED":
-            for node in self.nodes.values():
-                node["paradox"] = False
-            self.game_running = True
-            self.game_deadline = time.monotonic() + int(event.get("seconds", self.countdown_seconds.get()))
-            self.status_text.set(f"Kör elindult ({event.get('detail', 'normal')})")
-            self._tick_game_clock()
-        elif state == "NODE_PARADOX" and isinstance(node_id, int) and node_id in self.nodes:
-            self.nodes[node_id]["paradox"] = True
-            self.status_text.set(f"PARADOX: N{node_id} / hibakód: {event.get('detail', '--')}")
-            self.draw_map()
-        elif state == "NODE_REPAIRED" and isinstance(node_id, int) and node_id in self.nodes:
-            self.nodes[node_id]["paradox"] = False
-            self.status_text.set(f"N{node_id} javítva")
-            self.draw_map()
-        elif state == "REPAIR_REJECTED":
-            self.status_text.set(f"REPAIR elutasítva / 3 mp zár: N{node_id}")
-        elif state in ("VICTORY", "DEFEAT"):
-            self.game_running = False
-            self.game_clock.configure(text="DEFUSED" if state == "VICTORY" else "DEFEAT")
-            self.status_text.set(f"{state}: {event.get('detail', '')}")
-            if state == "VICTORY":
-                for node in self.nodes.values():
-                    node["paradox"] = False
-            self.draw_map()
+        if isinstance(node_id, int) and node_id in self.nodes:
+            node = self.nodes[node_id]
+            if event.get("node_state") is not None:
+                node["game_state"] = event["node_state"]
+            elif event_type == "NODE_FAULT":
+                node["game_state"] = event.get("detail", "PARADOX")
+            elif event_type == "NODE_RESTORED":
+                node["game_state"] = "NORMAL"
+            node["paradox"] = node["game_state"] in {"INVERSE", "PARADOX", "LOSS", "DELAY", "DUPLICATE", "INVALID_PAYLOAD"}
+            self._update_lobby_node(node_id)
+        if event_type == "ERROR":
+            self.status_text.set(f"Mission start rejected: {event.get('detail', 'UNKNOWN')}")
+
+    def _handle_mission_result(self, result: dict[str, Any]) -> None:
+        state = result.get("state", "MISSION_FAILED")
+        self.mission_state_text.set(state)
+        self.mission_progress_text.set(
+            f"PACKETS {result.get('delivered_packets', 0)} / {result.get('required_packets', 0)}"
+            f"     SCORE {result.get('score', 0)} / 100"
+        )
+        self.status_text.set(
+            f"{state}: {result.get('reason', '')} / score {result.get('score', 0)}"
+            f" / time {result.get('elapsed_seconds', 0)}s"
+            f" / failed {result.get('failed_packets', 0)} / retries {result.get('retries', 0)}"
+            f" / repairs {result.get('faults_repaired', 0)}/{result.get('faults_total', 0)}"
+        )
+
+    def _handle_ir_sample(self, event: dict[str, Any]) -> None:
+        self.ir_raw_text.set(
+            f"RAW {event.get('raw_level', '--')}    ACTIVE {event.get('active', '--')}    "
+            f"PULSE {event.get('pulse_ms', '--')} ms    GAP {event.get('gap_ms', '--')} ms    "
+            f"GROUP {event.get('group_active_ms', '--')} ms    CATEGORY {event.get('category', '--')}"
+        )
+        self.ir_measurement_text.set(event.get("reason", event.get("category", "IR SAMPLE")))
+        self.status_text.set(f"IR: {event.get('category', 'UNKNOWN')} / {event.get('reason', '')}")
 
     def _update_test_row(self, node_id: int, result: dict[str, Any]) -> None:
         if str(node_id) not in self.test_tree.get_children(""):
@@ -531,46 +839,63 @@ class TenetControlApp:
             node["online"] = True
             node["rssi"] = packet.get("rssi")
             node["last_seen"] = time.monotonic()
+            node["last_seen_wall"] = datetime.now()
+            node["communication_state"] = "ONLINE"
             direction = packet.get("dir")
             if direction in (-1, 1):
                 node["direction"] = direction
             if packet.get("type") == 4:
                 node["paradox"] = True
             self.draw_map()
-        if packet.get("type") == 3:
-            for node in self.nodes.values():
-                if node["role"] != "IR_REMOTE":
-                    node["direction"] *= -1
 
     def _append_log(self, message: dict[str, Any]) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
-        if "src" in message:
+        record = dict(message)
+        record["timestamp"] = timestamp
+        record["delivery_status"] = packet_status(record)
+        self.packet_records.insert(0, record)
+        del self.packet_records[500:]
+        self._render_packet_log()
+
+    def _render_packet_log(self) -> None:
+        if not hasattr(self, "packet_tree"):
+            return
+        self.packet_tree.delete(*self.packet_tree.get_children())
+        type_filter = self.packet_type_filter.get()
+        status_filter = self.packet_status_filter.get()
+        node_filter = self.packet_node_filter.get()
+        for record in self.packet_records:
+            if type_filter != "ALL" and str(record.get("type", "")) != type_filter:
+                continue
+            if status_filter != "ALL" and record.get("delivery_status") != status_filter:
+                continue
+            if node_filter != "ALL" and node_filter not in (str(record.get("src", "")), str(record.get("dst", ""))):
+                continue
+            payload = record.get("payload", record.get("detail", ""))
+            if not isinstance(payload, str):
+                payload = json.dumps(payload, ensure_ascii=False)
             values = (
-                timestamp,
-                message.get("src", ""),
-                message.get("dst", ""),
-                message.get("type", ""),
-                message.get("id", ""),
-                message.get("dir", ""),
-                message.get("rssi", ""),
-                str(message.get("payload", "")),
+                record.get("timestamp", ""), record.get("id", ""),
+                record.get("logical_packet_id", ""), record.get("mission_id", ""),
+                record.get("src", ""), record.get("dst", ""), record.get("type", record.get("event", "")),
+                record.get("delivery_status", "UNKNOWN"), record.get("retry_count", ""),
+                record.get("latency_ms", ""), record.get("rssi", ""), payload,
             )
-        else:
-            values = (timestamp, "-", "-", "EVT", "-", "-", "-", json.dumps(message, ensure_ascii=False))
-        self.packet_tree.insert("", 0, values=values)
-        children = self.packet_tree.get_children()
-        for item in children[500:]:
-            self.packet_tree.delete(item)
+            self.packet_tree.insert("", "end", values=values)
 
     def _refresh_node_states(self) -> None:
         now = time.monotonic()
         for node_id in MESH_NODE_IDS:
             if node_id == 5:
-                self.nodes[node_id]["online"] = self.gateway_connected
+                self.nodes[node_id]["online"] = self.gateway_ready
+                self.nodes[node_id]["communication_state"] = "ONLINE" if self.gateway_ready else "OFFLINE"
+                self._update_lobby_node(node_id)
                 continue
             last_seen = self.nodes[node_id]["last_seen"]
             if last_seen is not None and now - last_seen > 6:
                 self.nodes[node_id]["online"] = False
+                self.nodes[node_id]["communication_state"] = "OFFLINE"
+                self._update_lobby_node(node_id)
         self.draw_map()
         self.root.after(500, self._refresh_node_states)
 
@@ -590,14 +915,11 @@ class TenetControlApp:
             5: (0.50, 0.50),
         }
         points = {node_id: (int(x * width), int(y * height)) for node_id, (x, y) in positions.items()}
-        for node_id in (0, 1, 3, 4):
-            x, y = points[node_id]
-            gx, gy = points[5]
-            canvas.create_line(x, y, gx, gy, fill=COLORS["line"], width=1, dash=(4, 5))
         x2, y2 = points[2]
         x4, y4 = points[4]
         canvas.create_line(x2, y2 + 8, x4, y4 - 25, fill="#544d38", width=1, dash=(2, 5))
         canvas.create_text((x2 + x4) // 2 + 18, (y2 + y4) // 2, text="IR", fill=COLORS["yellow"], font=("Cascadia Mono", 8))
+        canvas.create_text(width // 2, height - 10, text="ESP-NOW FLOOD  /  DIRECT PEERS NOT ASSUMED", fill=COLORS["muted"], font=("Cascadia Mono", 7))
 
         online_count = sum(bool(self.nodes[node_id]["online"]) for node_id in MESH_NODE_IDS)
         if hasattr(self, "online_label"):
@@ -609,7 +931,7 @@ class TenetControlApp:
                 status = "IR TX / STANDALONE"
             elif node.get("paradox"):
                 color = COLORS["red"]
-                status = "PARADOX"
+                status = node["game_state"]
             elif node["online"]:
                 color = COLORS["lime"] if node["direction"] > 0 else COLORS["red"]
                 status = "ONLINE"
@@ -629,6 +951,7 @@ class TenetControlApp:
             canvas.create_text(x, y + radius + 31, text=details, fill=COLORS["muted"], font=("Segoe UI", 8))
 
     def clear_log(self) -> None:
+        self.packet_records.clear()
         for item in self.packet_tree.get_children():
             self.packet_tree.delete(item)
 

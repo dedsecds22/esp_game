@@ -47,12 +47,12 @@ Open the sketch matching the ESP being flashed:
 - `TenetIrGateRawTest/TenetIrGateRawTest.ino` - temporary raw sensor test
 - `TenetIrRemoteRawTest/TenetIrRemoteRawTest.ino` - temporary 38 kHz LED test
 
-The production IR_GATE uses the measured sensor polarity: GPIO 7 is LOW
-when idle and HIGH when IR is detected. It sends one mesh inversion on a
-LOW-to-HIGH transition, with the normal 8-second cooldown. It does not
-decode a NEC address or command; any IR source visible to the sensor can
-trigger it. The remote still emits the NEC-modulated IR frame, which the
-simple sensor only treats as detected light.
+The IR_GATE defaults to the measured sensor polarity (LOW idle, HIGH active)
+and captures edges with a GPIO interrupt. It groups pulses by the calibrated
+gap, sums active time in microseconds, then classifies SHORT/MEDIUM/LONG or
+rejects the group. It does not decode NEC/RC5 button codes. The remote still
+emits a modulated IR signal, but any visible compatible IR remote may be
+used. IR actions are accepted only when the Gateway permits them.
 
 ## Temporary raw IR test
 
@@ -152,35 +152,36 @@ timeout indicates the IR code, receiver wiring, or mesh path needs checking.
 Send `{"cmd":"ir_state"}` to query the IR_GATE's input level; the Gateway
 returns an `ir_state` event with `level` set to `LOW` or `HIGH`.
 
-Then start Defuse from the PC app's Game Mode. A successful mesh test is
-required first. The Gateway chooses an uninfected node at the selected
-difficulty interval and sends an encoded paradox event. Both TFTs display
-one byte of a shared random session key. Join the blue byte as the high
-byte and the red byte as the low byte to form `session_key`. The packet log
-shows the infected node ID and encoded error code; calculate
-`session_key = error_code XOR node_id` and submit the result as a four-digit
-hex repair key. A bad key locks repairs for three seconds. The
-Gateway declares victory when the countdown reaches zero with no paradox,
-or defeat if a mesh node goes offline for five seconds or a paradox remains
-at zero.
+Then start Network Recovery from Mission Control in the PC app. The Gateway
+validates the mission configuration, sends it to nodes 0, 1, 3, and 4, and
+waits for each node's application-level `CONFIG_OK`. Only then does the
+three-second countdown begin. Easy/Normal/Hard defaults are 300/240/180 s,
+20/12/6 s fault intervals, and 5/8/12 required logical packets.
 
-For a short transport-only round from Serial Monitor, send:
+During RUNNING, node faults are injected as game-state changes, not physical
+hardware failures. A data packet increments delivery progress only after
+its destination processes it and returns an application `ACK`. Retries use
+new transport message IDs and retain the logical packet ID. A repair is
+accepted only for a node currently reported faulty; the UI reports success
+only after `REPAIRING` followed by a node `NORMAL` status and command result.
+An offline required node or mission deadline produces `MISSION_FAILED`.
+The Gateway reports the final score components and mission result.
 
-1. Send `{"cmd":"start","seconds":10}`. Confirm blue counts down from
-	10 and red counts up from 0.
-2. Send `{"cmd":"invert"}`. Confirm both screens change from NORMAL to
-	INVERSE. This tests the control broadcast only; the separate IR test
-	checks the handheld-triggered broadcast.
-
-This first playable mode is Defuse. Payload Delivery and scoring remain
-future work.
+IR Calibration uses the measured LOW-idle/HIGH-active sensor by default.
+`ir_calibrate` captures pulse groups; `ir_config` applies the validated
+polarity, gap, duration bands, max group, and cooldown. `ir_state` remains an
+on-demand raw LOW/HIGH query. SHORT performs a status query, MEDIUM requests
+repair of an active fault, and LONG pauses/resumes; the Gateway returns an
+explicit accepted/rejected result.
 
 The Gateway accepts newline-terminated JSON commands such as
-`{"cmd":"start","seconds":60,"difficulty":"normal"}`, `{"cmd":"repair","target":1,"key":"0x4F2A"}`,
-`{"cmd":"invert"}`, `{"cmd":"ir_state"}`, and `{"cmd":"ping"}`. Mesh
-packets are output as JSON lines with `src`, `dst`, `type`, `id`, `dir`,
-`payload`, and `rssi` fields.
+`{"cmd":"mission_start","mission_id":123,"difficulty":"normal","duration_seconds":240,"packet_count":8,"packet_target":0,"fault_interval_seconds":12,"fault_intensity":2,"fault_types":["PARADOX","LOSS"]}`, `{"cmd":"mission_pause"}`, `{"cmd":"mission_resume"}`, `{"cmd":"mission_abort"}`, `{"cmd":"repair","target":1}`, `{"cmd":"ir_calibrate"}`, `{"cmd":"ir_config","active_high":true}`, `{"cmd":"ir_state"}`, and `{"cmd":"ping"}`. A running PC app sends `host_heartbeat` every two seconds; after five seconds without it, the Gateway pauses the mission. Resume is explicit.
 
-The shared ESP-NOW packet is 25 bytes with an XOR checksum. This firmware
-provides the radio bridge, TFT status screen, IR control, relay base, and
-initial Defuse mechanics. Payload Delivery and scoring remain future work.
+The shared ESP-NOW frame is 95 bytes with an XOR checksum and is below the
+250-byte ESP-NOW limit. It has a 15-byte header and an 80-byte payload
+field. Mission setup requires application-level CONFIG_OK
+from all four mesh nodes. Logical PACKET_DATA is only counted after a
+destination ACK; retries keep the logical ID and use new message IDs. The
+firmware implements the initial Network Recovery loop, but physical
+delivery/loss/retry, 2/4-player, IR-calibration, and complete mission-result
+tests remain required before claiming spec 1.0 acceptance.

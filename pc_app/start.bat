@@ -1,0 +1,1 @@
+.\.venv\Scripts\python.exe tenet_control.py
